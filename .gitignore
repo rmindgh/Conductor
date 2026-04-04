@@ -1,0 +1,23 @@
+# Runtime data (created per-user)
+goals.json
+decisions.json
+log.md
+flags/
+remote-control.log
+
+# Credentials (never commit)
+.credentials.json
+*.credentials
+*.token
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Node
+node_modules/
+
+# OS
+.DS_Store
+Thumbs.db
