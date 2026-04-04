@@ -1,17 +1,17 @@
 # Conductor
 
-A multi-session orchestration system for [Claude Code](https://docs.anthropic.com/en/docs/claude-code).
+A single Claude Code session that sees, understands, and controls all your other sessions.
 
-Run multiple Claude Code terminals. Monitor all of them from one place. Auto-approve safe tool calls. Block dangerous ones. Send tasks to any session. Get Telegram alerts when something needs your attention.
+Run multiple Claude Code terminals doing different work. Conductor sits in one session and maintains a coherent view of everything — what each session is working on, what they've accomplished, and what they need next. Not just monitoring. Understanding.
 
 ## What it does
 
-You run 4+ Claude Code sessions doing different work. Conductor sits in a fifth session and:
-
 - **Sees** what every session is doing (real-time via WebSocket or JSONL polling)
+- **Understands** context — tracks goals, progress, and relationships between sessions
 - **Approves** safe tool calls so sessions don't stall waiting for you to press Y
 - **Blocks** dangerous commands (force push, rm -rf) before they run
 - **Sends tasks** to any session — type a message here, it appears there
+- **Chains work** — when session A finishes, sends results to session B
 - **Alerts you** via Telegram when something needs human judgment
 
 ```
