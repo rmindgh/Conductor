@@ -23,6 +23,7 @@ import sys
 import os
 import argparse
 import logging
+import random
 import shlex
 from pathlib import Path
 from datetime import datetime, timezone
@@ -42,12 +43,227 @@ CONDUCTOR_DIR = CLAUDE_HOME / "conductor"
 GOALS_FILE = CONDUCTOR_DIR / "goals.json"
 LOG_FILE = CONDUCTOR_DIR / "log.md"
 DECISIONS_FILE = CONDUCTOR_DIR / "decisions.json"
+RC_STATUS_FILE = CONDUCTOR_DIR / "rc-status.json"
+PROJECTS_DIR = CLAUDE_HOME / "projects"
 
 API_BASE = "https://api.anthropic.com/v1"
 WS_BASE = "wss://api.anthropic.com/v1"
 
 # Safe tool names — always approve
 SAFE_TOOLS = {"Read", "Glob", "Grep", "WebSearch", "WebFetch", "TaskCreate", "TaskUpdate", "TaskList", "TaskGet"}
+
+# Live conductor stats for statusline indicator (updated by SessionMonitor).
+# Written to rc-status.json on every state change; read by gsd-statusline.js.
+_RC_STATS = {
+    "monitors": 0,
+    "drops": 0,
+    "escalations": 0,
+}
+
+
+def write_rc_status():
+    """Atomically write conductor stats to rc-status.json for statusline consumption."""
+    tmp = RC_STATUS_FILE.with_suffix(".json.tmp")
+    try:
+        with open(tmp, "w") as f:
+            json.dump(
+                {
+                    "updated_at": int(datetime.now(timezone.utc).timestamp()),
+                    **_RC_STATS,
+                },
+                f,
+            )
+        tmp.replace(RC_STATUS_FILE)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Auto-snapshot: capture recent session activity to project folder
+# ---------------------------------------------------------------------------
+#
+# Every SNAPSHOT_INTERVAL_SCANS scan cycles, iterates every project directory,
+# finds the most recently modified JSONL, reads its tail, and writes a markdown
+# snapshot to the worker's cwd (from the JSONL's first entry).
+#
+# Purpose: if a worker session gets compacted or crashes, the next session can
+# read this file to recover context without replaying history.
+
+SNAPSHOT_FILENAME = ".conductor-snapshot.md"
+SNAPSHOT_INTERVAL_SCANS = 10           # every 10 scans (~5 min at 30s interval)
+SNAPSHOT_ACTIVE_WINDOW_SEC = 600       # only snapshot sessions written in last 10 min
+
+
+def _read_jsonl_tail(path: Path, n_lines: int = 120) -> list:
+    """Read the last N lines of a JSONL file efficiently (seek from end)."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            chunk = min(size, max(n_lines * 4000, 64 * 1024))
+            f.seek(max(0, size - chunk))
+            raw = f.read().decode("utf-8", errors="replace")
+        return [line for line in raw.strip().split("\n") if line]
+    except Exception:
+        return []
+
+
+def _jsonl_first_entry(path: Path) -> dict:
+    """Read and parse the first line of a JSONL. Used to extract cwd."""
+    try:
+        with open(path, "rb") as f:
+            first = f.readline()
+        return json.loads(first.decode("utf-8", errors="replace"))
+    except Exception:
+        return {}
+
+
+def _build_snapshot_markdown(project_name: str, worker_cwd: str, jsonl_path: Path) -> str:
+    """Parse recent JSONL entries and format a snapshot markdown document."""
+    lines = _read_jsonl_tail(jsonl_path, n_lines=120)
+
+    user_msgs = []
+    assistant_actions = []
+    files_touched = {}
+
+    for raw in lines:
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        entry_type = data.get("type", "")
+        ts = data.get("timestamp", "")
+        msg = data.get("message", {})
+
+        if entry_type == "user":
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                text = " ".join(
+                    b.get("text", "")
+                    for b in content
+                    if isinstance(b, dict) and b.get("type") == "text"
+                )
+            else:
+                text = ""
+            text = text.strip()
+            # Skip tool_result wrappers and system reminders
+            if text and not text.startswith("<") and not text.startswith("[Request interrupted"):
+                user_msgs.append((ts, text[:200]))
+
+        elif entry_type == "assistant":
+            content = msg.get("content", [])
+            texts = []
+            tool_calls = []
+            for block in content if isinstance(content, list) else []:
+                if not isinstance(block, dict):
+                    continue
+                btype = block.get("type")
+                if btype == "text":
+                    texts.append(block.get("text", "")[:200])
+                elif btype == "tool_use":
+                    name = block.get("name", "")
+                    tool_calls.append(name)
+                    inp = block.get("input", {})
+                    if isinstance(inp, dict):
+                        fp = inp.get("file_path", "")
+                        if fp and name in ("Edit", "Write", "MultiEdit"):
+                            files_touched[fp] = files_touched.get(fp, 0) + 1
+            if texts or tool_calls:
+                assistant_actions.append((ts, " ".join(texts).strip(), tool_calls))
+
+    user_tail = user_msgs[-8:]
+    asst_tail = assistant_actions[-15:]
+
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    md = [
+        f"# Conductor Snapshot — {project_name}",
+        "",
+        f"**Auto-generated:** {now}",
+        f"**Worker cwd:** `{worker_cwd}`",
+        f"**Source:** `{jsonl_path.name}`",
+        "",
+        "> This file is rewritten every ~5 minutes by Claude Conductor while the session is active.",
+        "> It captures recent activity so a compacted or restarted worker can recover context fast.",
+        "> Safe to delete — it will be recreated on the next snapshot tick.",
+        "",
+        "## Recent user tasks",
+        "",
+    ]
+    if user_tail:
+        for ts, text in user_tail:
+            tshort = ts[11:19] if len(ts) >= 19 else ts
+            md.append(f"- `{tshort}` {text}")
+    else:
+        md.append("*(no user messages in window)*")
+    md.append("")
+    md.append("## Recent assistant activity")
+    md.append("")
+    if asst_tail:
+        for ts, text, tools in asst_tail:
+            tshort = ts[11:19] if len(ts) >= 19 else ts
+            tool_suffix = f" `[{', '.join(tools)}]`" if tools else ""
+            text_preview = text[:150] + ("…" if len(text) > 150 else "")
+            md.append(f"- `{tshort}`{tool_suffix} {text_preview}".rstrip())
+    else:
+        md.append("*(no assistant activity in window)*")
+    md.append("")
+    md.append("## Files touched in window")
+    md.append("")
+    if files_touched:
+        sorted_files = sorted(files_touched.items(), key=lambda x: -x[1])
+        for fp, count in sorted_files[:20]:
+            md.append(f"- `{fp}` ({count}x)")
+    else:
+        md.append("*(no file edits in window)*")
+    md.append("")
+
+    return "\n".join(md)
+
+
+def snapshot_active_projects() -> int:
+    """Iterate project dirs, snapshot every one with a recently-modified JSONL.
+    Writes `.conductor-snapshot.md` to each worker's cwd. Returns snapshot count.
+    """
+    if not PROJECTS_DIR.exists():
+        return 0
+    now_ts = datetime.now(timezone.utc).timestamp()
+    written = 0
+    for pdir in PROJECTS_DIR.iterdir():
+        if not pdir.is_dir():
+            continue
+        jsonls = [p for p in pdir.glob("*.jsonl") if p.is_file()]
+        if not jsonls:
+            continue
+        most_recent = max(jsonls, key=lambda p: p.stat().st_mtime)
+        if now_ts - most_recent.stat().st_mtime > SNAPSHOT_ACTIVE_WINDOW_SEC:
+            continue  # idle session, skip
+
+        first = _jsonl_first_entry(most_recent)
+        worker_cwd = first.get("cwd", "")
+        if not worker_cwd:
+            continue
+        cwd_path = Path(worker_cwd)
+        if not cwd_path.exists() or not cwd_path.is_dir():
+            continue
+
+        parts = pdir.name.split("-")
+        project_name = parts[-1] if parts else pdir.name
+
+        try:
+            md_text = _build_snapshot_markdown(project_name, worker_cwd, most_recent)
+            snapshot_file = cwd_path / SNAPSHOT_FILENAME
+            tmp_file = snapshot_file.with_suffix(".md.tmp")
+            tmp_file.write_text(md_text, encoding="utf-8")
+            tmp_file.replace(snapshot_file)
+            written += 1
+        except Exception as e:
+            log.debug(f"Snapshot failed for {pdir.name}: {e}")
+
+    return written
+
 
 # ---------------------------------------------------------------------------
 # Shell command safety analysis
@@ -549,7 +765,14 @@ class SessionMonitor:
         self.short_id = session_id[:8]
 
     async def connect(self):
-        """Connect to session WebSocket and handle permission requests"""
+        """Connect to session WebSocket and handle permission requests.
+
+        Resilient reconnection strategy:
+          - 1006 and other transient drops: infinite retries with exponential backoff + jitter (capped 60s)
+          - 4001 (session not found): up to 3 consecutive attempts, then bail (session is truly dead)
+          - 4003 (unauthorized): bail immediately (token needs refresh)
+          - ping_interval=20s to outrun typical server idle timeouts
+        """
         url = f"{WS_BASE}/sessions/ws/{self.session_id}/subscribe"
         if self.org_uuid:
             url += f"?organization_uuid={self.org_uuid}"
@@ -559,24 +782,32 @@ class SessionMonitor:
             "anthropic-version": "2023-06-01",
         }
 
-        retry_count = 0
-        max_retries = 5
+        transient_drops = 0
+        session_gone_count = 0
+        MAX_SESSION_GONE = 3
+        BACKOFF_CAP = 60.0
 
-        while retry_count < max_retries:
+        while True:
             try:
                 log.info(f"[{self.short_id}] Connecting to {self.project}...")
                 async with websockets.connect(
                     url,
                     additional_headers=headers,
-                    ping_interval=30,
+                    ping_interval=20,
                     ping_timeout=10,
                     close_timeout=5,
+                    max_size=10 * 1024 * 1024,
                 ) as ws:
                     self.ws = ws
                     self.connected = True
-                    retry_count = 0
-                    log.info(f"[{self.short_id}] Connected to {self.project}")
-                    log_to_file(f"RC connected to {self.project} ({self.short_id})")
+                    if transient_drops > 0:
+                        log.info(f"[{self.short_id}] Reconnected after {transient_drops} drop(s)")
+                        log_to_file(f"RC reconnected {self.project} after {transient_drops} drops")
+                    else:
+                        log.info(f"[{self.short_id}] Connected to {self.project}")
+                        log_to_file(f"RC connected to {self.project} ({self.short_id})")
+                    transient_drops = 0
+                    session_gone_count = 0
 
                     async for message in ws:
                         log.debug(f"[{self.short_id}] RAW: {str(message)[:200]}")
@@ -586,26 +817,49 @@ class SessionMonitor:
                         except json.JSONDecodeError:
                             log.warning(f"[{self.short_id}] Non-JSON message: {str(message)[:100]}")
 
+                # Exited async-with cleanly — server closed normally. Treat as transient.
+                log.info(f"[{self.short_id}] Connection closed normally, reconnecting...")
+                transient_drops += 1
+
             except websockets.exceptions.ConnectionClosedError as e:
                 if e.code == 4003:
-                    log.error(f"[{self.short_id}] Unauthorized (4003). Token may be invalid.")
+                    log.error(f"[{self.short_id}] Unauthorized (4003). Token invalid — bailing.")
+                    log_to_file(f"RC BAIL {self.project}: unauthorized (4003)")
                     break
-                elif e.code == 4001:
-                    retry_count += 1
-                    log.warning(f"[{self.short_id}] Session not found (4001). Retry {retry_count}/{max_retries}")
+                if e.code == 4001:
+                    session_gone_count += 1
+                    if session_gone_count >= MAX_SESSION_GONE:
+                        log.warning(f"[{self.short_id}] Session gone (4001 x{session_gone_count}) — bailing.")
+                        log_to_file(f"RC BAIL {self.project}: session gone")
+                        break
+                    log.warning(f"[{self.short_id}] Session not found (4001) {session_gone_count}/{MAX_SESSION_GONE}")
                 else:
-                    retry_count += 1
-                    log.warning(f"[{self.short_id}] Connection closed ({e.code}). Retry {retry_count}/{max_retries}")
+                    transient_drops += 1
+                    log.warning(f"[{self.short_id}] Connection dropped ({e.code}), transient #{transient_drops}")
+
+            except asyncio.CancelledError:
+                log.info(f"[{self.short_id}] Monitor cancelled")
+                raise
 
             except Exception as e:
-                retry_count += 1
-                log.warning(f"[{self.short_id}] Error: {e}. Retry {retry_count}/{max_retries}")
+                transient_drops += 1
+                log.warning(
+                    f"[{self.short_id}] Network/unexpected error: {type(e).__name__}: {e}, "
+                    f"transient #{transient_drops}"
+                )
 
-            if retry_count < max_retries:
-                await asyncio.sleep(2 * retry_count)
+            # Update stats and schedule reconnect
+            _RC_STATS["drops"] += 1
+            write_rc_status()
+
+            # Exponential backoff with jitter, capped at BACKOFF_CAP
+            base = min(2.0 ** min(transient_drops, 6), BACKOFF_CAP)
+            sleep_time = min(base + random.uniform(0, min(base * 0.25, 5.0)), BACKOFF_CAP)
+            log.info(f"[{self.short_id}] Reconnecting in {sleep_time:.1f}s...")
+            await asyncio.sleep(sleep_time)
 
         self.connected = False
-        log.info(f"[{self.short_id}] Disconnected from {self.project}")
+        log.info(f"[{self.short_id}] Monitor stopped for {self.project}")
 
     async def handle_message(self, msg: dict):
         """Handle incoming WebSocket messages"""
@@ -693,6 +947,8 @@ class SessionMonitor:
                     log_to_file(f"RC APPROVED {self.project}: {tool_name} — {reason}")
                 else:
                     # Don't deny — just don't respond. Let it sit for human.
+                    _RC_STATS["escalations"] += 1
+                    write_rc_status()
                     log.warning(f"[{self.short_id}] ESCALATED — not auto-approving {tool_name}")
                     log_to_file(f"RC ESCALATED {self.project}: {tool_name} — {reason}")
 
@@ -844,6 +1100,10 @@ async def run(args):
             del active_monitors[sid]
             log.info(f"Session {sid[:12]} disconnected, removed from monitors")
 
+        # Update statusline indicator with current monitor count
+        _RC_STATS["monitors"] = len(active_monitors)
+        write_rc_status()
+
     # Initial scan
     await scan_and_connect()
 
@@ -853,6 +1113,7 @@ async def run(args):
 
     # Continuous scan loop — check for new sessions every 30s
     scan_interval = 30
+    scan_iteration = 0
     try:
         while True:
             await asyncio.sleep(scan_interval)
@@ -874,6 +1135,17 @@ async def run(args):
             alive = sum(1 for t in active_monitors.values() if not t.done())
             if alive:
                 log.debug(f"Status: {alive} active monitors")
+
+            # Auto-snapshot: every Nth scan, write snapshots for active projects
+            scan_iteration += 1
+            if scan_iteration % SNAPSHOT_INTERVAL_SCANS == 0:
+                try:
+                    count = snapshot_active_projects()
+                    if count > 0:
+                        log.info(f"Wrote {count} conductor snapshot(s)")
+                        log_to_file(f"Snapshots written: {count}")
+                except Exception as e:
+                    log.warning(f"Snapshot pass failed: {e}")
 
     except (KeyboardInterrupt, asyncio.CancelledError):
         log.info("Shutting down...")

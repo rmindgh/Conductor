@@ -214,6 +214,26 @@ See [docs/protocol.md](docs/protocol.md) for the full protocol documentation.
 - Tool approvals via `control_response` with `behavior: "allow"` or `"deny"`
 - Can inject user messages via `POST /v1/sessions/{id}/events`
 
+## Resilience & recovery
+
+The `remote-control.py` service handles three operational concerns automatically:
+
+**Connection resilience.** WebSocket drops (error code 1006 is common — server-side idle timeouts and network blips) are retried indefinitely with exponential backoff + jitter (2s → 60s cap). Auth failures (`4003`) bail immediately; confirmed-dead sessions (`4001` × 3) bail after three attempts. `ping_interval` is set to 20s to stay ahead of typical idle timeouts. A previous 5-retry hard limit would give up permanently after ~30s of flaky connection — that's gone.
+
+**Status file for external consumers.** The service writes `~/.claude/conductor/rc-status.json` on every monitor state change:
+
+```json
+{"updated_at": 1775406421, "monitors": 5, "drops": 3, "escalations": 0}
+```
+
+Atomic write via `.tmp` + rename — readers never see a partial file. A statusline script or any other process can read this to show a live monitor count, drop counter, or escalation alert.
+
+**Auto-snapshots.** Every ~5 minutes, the service scans all Claude Code project directories, finds JSONLs written in the last 10 minutes, extracts recent user tasks, assistant activity, and files touched, and writes a markdown snapshot (`.conductor-snapshot.md`) to the worker's `cwd`. If a session gets compacted or crashes, the next session can read this file to recover context in seconds instead of replaying history. Snapshots are safe to delete — they regenerate on the next tick. Add `.conductor-snapshot.md` to your global gitignore if you don't want it tracked:
+
+```bash
+echo ".conductor-snapshot.md" >> ~/.config/git/ignore
+```
+
 ## Files
 
 ```
@@ -234,7 +254,11 @@ Runtime files (created automatically):
   goals.json             # Session goals + risk levels
   decisions.json         # Decision log (last 100)
   log.md                 # Activity log
+  rc-status.json         # Live monitor stats (for statusline consumers)
   flags/                 # Per-session block/proceed flags
+
+{worker_cwd}/
+  .conductor-snapshot.md # Per-project activity snapshot (rewritten every ~5 min, safe to delete)
 ```
 
 ## Limitations
