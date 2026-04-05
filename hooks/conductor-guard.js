@@ -23,20 +23,168 @@ const CONDUCTOR_DIR = path.join(require('os').homedir(), '.claude', 'conductor')
 const FLAGS_DIR = path.join(CONDUCTOR_DIR, 'flags');
 const LOG_FILE = path.join(CONDUCTOR_DIR, 'log.md');
 
-// Commands that should ALWAYS be blocked regardless of flags
-const DANGEROUS_PATTERNS = [
-  /git\s+push\s+.*--force/i,
-  /git\s+push\s+-f\b/i,
-  /git\s+reset\s+--hard/i,
-  /git\s+clean\s+-f/i,
-  /git\s+checkout\s+--\s+\./i,
-  /\brm\s+-rf\s+[\/~]/i,          // rm -rf starting from root or home
-  /\brm\s+-rf\s+\*/i,             // rm -rf *
-  /DROP\s+(?:TABLE|DATABASE)/i,   // SQL destructive
-  /DELETE\s+FROM\s+\w+\s*;/i,     // SQL delete without WHERE
-  /format\s+[a-z]:/i,             // Windows format drive
-  /del\s+\/[sfq]/i,               // Windows recursive delete
-];
+// ---------------------------------------------------------------------------
+// Shell command safety analysis
+// ---------------------------------------------------------------------------
+//
+// IMPORTANT: This is defense-in-depth against honest mistakes, NOT a security
+// boundary against adversarial input. A motivated attacker can always bypass
+// these checks via variable expansion, command substitution, encoded payloads,
+// or shell wrappers. The primary security boundary is human approval and the
+// conductor flag system.
+//
+// This analyzer tokenizes commands (vs substring/regex match) to catch common
+// bypasses like `git push -fu` (where `-f` is inside a combined flag cluster).
+
+/**
+ * Naive shell tokenizer — splits on whitespace but respects simple quoting.
+ * Not a full shell parser — does not handle $(...), backticks, or escapes beyond basic quotes.
+ */
+function tokenize(command) {
+  const tokens = [];
+  let current = '';
+  let inSingle = false;
+  let inDouble = false;
+  let escape = false;
+
+  for (const ch of command) {
+    if (escape) {
+      current += ch;
+      escape = false;
+      continue;
+    }
+    if (ch === '\\' && !inSingle) {
+      escape = true;
+      continue;
+    }
+    if (ch === "'" && !inDouble) {
+      inSingle = !inSingle;
+      continue;
+    }
+    if (ch === '"' && !inSingle) {
+      inDouble = !inDouble;
+      continue;
+    }
+    if (/\s/.test(ch) && !inSingle && !inDouble) {
+      if (current) {
+        tokens.push(current);
+        current = '';
+      }
+      continue;
+    }
+    current += ch;
+  }
+  if (current) tokens.push(current);
+  return tokens;
+}
+
+function hasForceFlag(tokens) {
+  for (const t of tokens) {
+    if (!t.startsWith('-')) continue;
+    if (t === '--force' || t === '--force-with-lease') return true;
+    // Short flag cluster: -f, -fu, -uf, -vfu, etc.
+    if (!t.startsWith('--') && t.length > 1 && t.slice(1).includes('f')) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function hasRecursiveForceFlag(tokens) {
+  for (const t of tokens) {
+    if (!t.startsWith('-') || t.startsWith('--')) continue;
+    const flags = t.slice(1);
+    if ((flags.includes('r') || flags.includes('R')) && flags.includes('f')) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function analyzeBashCommand(command) {
+  const tokens = tokenize(command);
+  if (tokens.length === 0) return { dangerous: false };
+
+  // Skip leading VAR=value assignments
+  let cmdIdx = 0;
+  while (cmdIdx < tokens.length) {
+    const t = tokens[cmdIdx];
+    if (t.includes('=') && !t.startsWith('-') && !t.startsWith('/')) {
+      cmdIdx++;
+    } else {
+      break;
+    }
+  }
+  if (cmdIdx >= tokens.length) return { dangerous: false };
+
+  const cmd = tokens[cmdIdx];
+  const args = tokens.slice(cmdIdx + 1);
+  const cmdBase = cmd.includes('/') ? cmd.split('/').pop() : cmd;
+
+  // rm with recursive force
+  if (cmdBase === 'rm') {
+    if (hasRecursiveForceFlag(args)) {
+      const targets = args.filter(a => !a.startsWith('-'));
+      for (const target of targets) {
+        if (['/', '/*', '~', '~/', '*', '.'].includes(target)) {
+          return { dangerous: true, reason: `rm -rf against dangerous target: ${target}` };
+        }
+        if (target.startsWith('/') && (target.match(/\//g) || []).length <= 2) {
+          return { dangerous: true, reason: `rm -rf against top-level path: ${target}` };
+        }
+      }
+      return { dangerous: true, reason: 'rm with -rf flag' };
+    }
+  }
+
+  // git destructive operations
+  if (cmdBase === 'git' && args.length > 0) {
+    const sub = args[0];
+    const subArgs = args.slice(1);
+
+    if (sub === 'push' && hasForceFlag(subArgs)) {
+      return { dangerous: true, reason: 'git push with force flag' };
+    }
+    if (sub === 'reset' && subArgs.includes('--hard')) {
+      return { dangerous: true, reason: 'git reset --hard' };
+    }
+    if (sub === 'clean' && hasForceFlag(subArgs)) {
+      return { dangerous: true, reason: 'git clean with force flag' };
+    }
+    if (sub === 'checkout' && (subArgs.includes('.') || subArgs.includes('--'))) {
+      return { dangerous: true, reason: 'git checkout discarding local changes' };
+    }
+    if (sub === 'branch' && subArgs.includes('-D')) {
+      return { dangerous: true, reason: 'git branch -D (force delete)' };
+    }
+  }
+
+  // NOTE: sh -c / bash -c / python -c / curl | sh are NOT blocked here.
+  // They are legitimate commands used every session. The auto-approve layer
+  // (remote-control.py) escalates them for human review, but the hook allows
+  // them because blocking every exec wrapper would break most sessions.
+
+  // Destructive SQL in SQL contexts
+  const sqlContexts = ['psql', 'mysql', 'sqlite3', 'mongo', 'mongosh', 'redis-cli'];
+  if (sqlContexts.includes(cmdBase) || tokens.some(t => sqlContexts.some(s => t.includes(s)))) {
+    const upper = command.toUpperCase();
+    for (const pat of ['DROP TABLE', 'DROP DATABASE', 'TRUNCATE TABLE']) {
+      if (upper.includes(pat)) {
+        return { dangerous: true, reason: `SQL destructive: ${pat}` };
+      }
+    }
+  }
+
+  // Windows destructive
+  if (cmdBase.toLowerCase() === 'format') {
+    return { dangerous: true, reason: 'Windows format command' };
+  }
+  if (cmdBase.toLowerCase() === 'del' && args.some(a => /^\/[sfqSFQ]/.test(a))) {
+    return { dangerous: true, reason: 'Windows del /s or /q' };
+  }
+
+  return { dangerous: false };
+}
 
 // Commands that are always safe — skip flag check for speed
 const SAFE_TOOL_NAMES = ['Read', 'Glob', 'Grep', 'WebSearch', 'WebFetch', 'TaskCreate', 'TaskUpdate', 'TaskList', 'TaskGet'];
@@ -58,18 +206,17 @@ process.stdin.on('end', () => {
       process.exit(0);
     }
 
-    // --- Layer 1: Pattern-based blocking ---
+    // --- Layer 1: Tokenized command analysis (not substring/regex) ---
     if (toolName === 'Bash') {
       const command = toolInput.command || '';
-      for (const pattern of DANGEROUS_PATTERNS) {
-        if (pattern.test(command)) {
-          logBlock(sessionId, toolName, command, `dangerous pattern: ${pattern.source}`);
-          process.stdout.write(JSON.stringify({
-            decision: 'block',
-            reason: `CONDUCTOR: "${command.substring(0, 100)}" blocked — matches dangerous pattern: ${pattern.source}`,
-          }));
-          return process.exit(0);
-        }
+      const analysis = analyzeBashCommand(command);
+      if (analysis.dangerous) {
+        logBlock(sessionId, toolName, command, analysis.reason);
+        process.stdout.write(JSON.stringify({
+          decision: 'block',
+          reason: `CONDUCTOR: "${command.substring(0, 100)}" blocked — ${analysis.reason}`,
+        }));
+        return process.exit(0);
       }
     }
 

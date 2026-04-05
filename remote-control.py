@@ -23,6 +23,7 @@ import sys
 import os
 import argparse
 import logging
+import shlex
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional
@@ -45,17 +46,158 @@ DECISIONS_FILE = CONDUCTOR_DIR / "decisions.json"
 API_BASE = "https://api.anthropic.com/v1"
 WS_BASE = "wss://api.anthropic.com/v1"
 
-# Dangerous patterns — always escalate, never auto-approve
-DANGEROUS_PATTERNS = [
-    "git push --force", "git push -f",
-    "git reset --hard", "git clean -f",
-    "rm -rf /", "rm -rf ~", "rm -rf *",
-    "DROP TABLE", "DROP DATABASE",
-    "format c:", "del /s",
-]
-
 # Safe tool names — always approve
 SAFE_TOOLS = {"Read", "Glob", "Grep", "WebSearch", "WebFetch", "TaskCreate", "TaskUpdate", "TaskList", "TaskGet"}
+
+# ---------------------------------------------------------------------------
+# Shell command safety analysis
+# ---------------------------------------------------------------------------
+#
+# IMPORTANT: This is defense-in-depth against honest mistakes, NOT a security
+# boundary against adversarial input. A motivated attacker can always bypass
+# substring/tokenization checks via:
+#   - Variable expansion: CMD="rm -rf /"; $CMD
+#   - Command substitution: $(echo "rm -rf /")
+#   - Encoded payloads: echo <base64> | base64 -d | sh
+#   - Different shells: bash -c, sh -c, python -c, etc.
+#
+# The primary security boundary is the human-in-the-loop approval prompt.
+# This analyzer catches ~90% of obvious footguns; anything adversarial must
+# be blocked by the conductor flag system or human approval.
+
+
+def _has_force_flag(tokens: list[str]) -> bool:
+    """Check if tokens contain a force-push flag in any form: -f, --force, -fu, -uf, --force-with-lease."""
+    for token in tokens:
+        if not token.startswith("-"):
+            continue
+        if token in ("--force", "--force-with-lease"):
+            return True
+        # Short flag cluster: -f, -fu, -uf, -vfu, etc.
+        if not token.startswith("--") and len(token) > 1:
+            if "f" in token[1:]:
+                return True
+    return False
+
+
+def _has_recursive_force_flag(tokens: list[str]) -> bool:
+    """Check for rm-style -rf/-fr combinations in any form."""
+    for token in tokens:
+        if not token.startswith("-") or token.startswith("--"):
+            continue
+        flags = token[1:]
+        if "r" in flags and "f" in flags:
+            return True
+        if "R" in flags and "f" in flags:
+            return True
+    return False
+
+
+def _analyze_bash_command(command: str) -> tuple[bool, str]:
+    """
+    Tokenize shell command and check for dangerous operations.
+    Returns (is_dangerous, reason).
+
+    Caveats:
+      - Only analyzes the first command in a pipeline
+      - Cannot see through variable expansion, command substitution, or eval
+      - Backticks, $(...), and sh -c "..." hide inner commands
+    """
+    # Unparseable shell -> treat as suspicious
+    try:
+        tokens = shlex.split(command, comments=False, posix=True)
+    except ValueError:
+        return True, "Unparseable shell command (possible injection attempt)"
+
+    if not tokens:
+        return False, ""
+
+    # Skip leading VAR=value assignments
+    cmd_idx = 0
+    while cmd_idx < len(tokens):
+        tok = tokens[cmd_idx]
+        if "=" in tok and not tok.startswith("-") and not tok.startswith("/"):
+            cmd_idx += 1
+        else:
+            break
+    if cmd_idx >= len(tokens):
+        return False, ""
+
+    cmd = tokens[cmd_idx]
+    args = tokens[cmd_idx + 1:]
+    cmd_base = os.path.basename(cmd)  # handle /bin/rm, /usr/bin/git, etc.
+
+    # ---- rm with recursive force ----
+    if cmd_base == "rm":
+        if _has_recursive_force_flag(args):
+            # Check if target is catastrophic
+            targets = [a for a in args if not a.startswith("-")]
+            for target in targets:
+                if target in ("/", "/*", "~", "~/", "*", "."):
+                    return True, f"rm -rf against dangerous target: {target}"
+                if target.startswith("/") and target.count("/") <= 2:
+                    return True, f"rm -rf against top-level path: {target}"
+            # Even without a known-bad target, -rf on unknown paths is worth escalating
+            return True, "rm with -rf flag"
+
+    # ---- git destructive operations ----
+    if cmd_base == "git" and args:
+        subcommand = args[0]
+        sub_args = args[1:]
+
+        if subcommand == "push" and _has_force_flag(sub_args):
+            return True, "git push with force flag"
+
+        if subcommand == "reset" and "--hard" in sub_args:
+            return True, "git reset --hard"
+
+        if subcommand == "clean" and _has_force_flag(sub_args):
+            return True, "git clean with force flag"
+
+        if subcommand == "checkout" and any(a in sub_args for a in (".", "--")):
+            # git checkout . or git checkout -- <file> can destroy uncommitted work
+            return True, "git checkout discarding local changes"
+
+        if subcommand == "branch" and "-D" in sub_args:
+            return True, "git branch -D (force delete)"
+
+        if subcommand == "reflog" and "expire" in sub_args:
+            return True, "git reflog expire"
+
+    # ---- Destructive SQL (only in commands that look like SQL execution) ----
+    sql_contexts = {"psql", "mysql", "sqlite3", "mongo", "mongosh", "redis-cli"}
+    if cmd_base in sql_contexts or any(
+        "psql" in t or "mysql" in t or "sqlite" in t for t in tokens
+    ):
+        cmd_upper = command.upper()
+        for sql_pattern in ("DROP TABLE", "DROP DATABASE", "TRUNCATE TABLE", "DELETE FROM"):
+            if sql_pattern in cmd_upper:
+                return True, f"SQL destructive: {sql_pattern}"
+
+    # ---- Windows destructive ----
+    if cmd_base.lower() in ("format", "del"):
+        if cmd_base.lower() == "format":
+            return True, "Windows format command"
+        if "/s" in [a.lower() for a in args] or "/q" in [a.lower() for a in args]:
+            return True, "Windows del /s or /q"
+
+    # ---- Shell exec wrappers hide inner commands ----
+    exec_wrappers = {"sh", "bash", "zsh", "python", "python3", "node", "eval"}
+    if cmd_base in exec_wrappers and "-c" in args:
+        # Can't safely analyze the wrapped command — escalate for human review
+        return True, f"{cmd_base} -c wrapper hides inner command"
+
+    # ---- Pipe to shell is always suspicious ----
+    if "| sh" in command or "| bash" in command or "|sh" in command or "|bash" in command:
+        return True, "Pipe to shell execution"
+
+    # ---- curl | sh pattern ----
+    if ("curl" in tokens or "wget" in tokens) and (
+        "| sh" in command or "| bash" in command or "|sh" in command or "|bash" in command
+    ):
+        return True, "curl | sh pattern (remote code execution)"
+
+    return False, ""
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -143,28 +285,53 @@ def make_decision(tool_name: str, tool_input: dict, session_id: str, goals: dict
     if tool_name in SAFE_TOOLS:
         return "approve", f"Safe tool ({tool_name})"
 
-    # Check for dangerous patterns in Bash commands
+    # Check for dangerous patterns in Bash commands (tokenized, not substring)
     if tool_name == "Bash":
         command = tool_input.get("command", "")
-        for pattern in DANGEROUS_PATTERNS:
-            if pattern.lower() in command.lower():
-                return "escalate", f"Dangerous: '{command[:80]}' matches '{pattern}'"
 
-        # Git read commands — safe
-        git_read_cmds = ["git log", "git status", "git diff", "git branch", "git show", "git remote", "worktree list"]
-        if any(cmd in command.lower() for cmd in git_read_cmds):
-            return "approve", f"Read-only git command"
+        # Primary safety check: tokenized analysis
+        is_dangerous, danger_reason = _analyze_bash_command(command)
+        if is_dangerous:
+            return "escalate", f"Dangerous: {danger_reason} | cmd: '{command[:80]}'"
 
-        # Git commit in low/medium risk
-        if any(cmd in command.lower() for cmd in ["git commit", "git add"]) and risk_level in ("low", "medium"):
-            return "approve", f"Git commit in {risk_level}-risk session"
+        # Tokenize once for all checks below
+        try:
+            tokens = shlex.split(command, comments=False, posix=True)
+        except ValueError:
+            return "escalate", "Unparseable shell command"
 
-        # Git push (non-force) in low/medium risk
-        if "git push" in command.lower() and "--force" not in command.lower() and "-f" not in command.split():
-            if risk_level in ("low", "medium"):
-                return "approve", f"Git push (non-force) in {risk_level}-risk session"
-            else:
-                return "escalate", f"Git push in {risk_level}-risk session"
+        if not tokens:
+            return "approve", "Empty bash command"
+
+        # Skip VAR=value prefixes to find the real command
+        cmd_idx = 0
+        while cmd_idx < len(tokens) and "=" in tokens[cmd_idx] and not tokens[cmd_idx].startswith(("-", "/")):
+            cmd_idx += 1
+        if cmd_idx >= len(tokens):
+            return "approve", "Environment-only command"
+
+        first_cmd = os.path.basename(tokens[cmd_idx])
+        sub_args = tokens[cmd_idx + 1:] if cmd_idx + 1 < len(tokens) else []
+
+        # Read-only git commands
+        if first_cmd == "git" and sub_args:
+            git_sub = sub_args[0]
+            if git_sub in ("log", "status", "diff", "show", "remote", "worktree", "config", "rev-parse", "ls-files"):
+                return "approve", f"Read-only git command: git {git_sub}"
+
+            # git branch (without -D) is read-only
+            if git_sub == "branch" and "-D" not in sub_args and "-d" not in sub_args:
+                return "approve", "git branch (list)"
+
+            # Git commit/add in low/medium risk
+            if git_sub in ("commit", "add") and risk_level in ("low", "medium"):
+                return "approve", f"git {git_sub} in {risk_level}-risk session"
+
+            # Git push (already passed dangerous check, so no force flag)
+            if git_sub == "push":
+                if risk_level in ("low", "medium"):
+                    return "approve", f"git push (non-force) in {risk_level}-risk session"
+                return "escalate", f"git push in {risk_level}-risk session"
 
         # General Bash in low risk
         if risk_level == "low":
