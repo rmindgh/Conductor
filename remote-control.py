@@ -15,6 +15,9 @@ Usage:
   python remote-control.py --session ID       # Monitor specific session
   python remote-control.py --approve-all      # Auto-approve everything (dangerous!)
   python remote-control.py --dry-run          # Log decisions without acting
+
+Tests: tests/test_dead_session_bail.py (8 unit tests covering the InvalidStatus
+handler + _DEAD_SESSIONS denylist). Run with: python -m pytest tests/ -v
 """
 
 import asyncio
@@ -30,6 +33,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import websockets
+from websockets.exceptions import InvalidStatus
 import httpx
 
 # ---------------------------------------------------------------------------
@@ -59,6 +63,12 @@ _RC_STATS = {
     "drops": 0,
     "escalations": 0,
 }
+
+# Session IDs that bailed due to dead-session HTTP errors. The scan loop
+# skips these so dead sessions don't get endlessly re-discovered and retried.
+# Cleared on process restart (natural safety valve — if a session comes back,
+# restart the conductor to pick it up again).
+_DEAD_SESSIONS: set[str] = set()
 
 
 def write_rc_status():
@@ -784,7 +794,9 @@ class SessionMonitor:
 
         transient_drops = 0
         session_gone_count = 0
+        handshake_auth_fails = 0   # HTTP 401/403 during WS upgrade = dead session
         MAX_SESSION_GONE = 3
+        MAX_HANDSHAKE_AUTH_FAILS = 3
         BACKOFF_CAP = 60.0
 
         while True:
@@ -808,6 +820,7 @@ class SessionMonitor:
                         log_to_file(f"RC connected to {self.project} ({self.short_id})")
                     transient_drops = 0
                     session_gone_count = 0
+                    handshake_auth_fails = 0
 
                     async for message in ws:
                         log.debug(f"[{self.short_id}] RAW: {str(message)[:200]}")
@@ -840,6 +853,36 @@ class SessionMonitor:
             except asyncio.CancelledError:
                 log.info(f"[{self.short_id}] Monitor cancelled")
                 raise
+
+            except InvalidStatus as e:
+                # HTTP error during WS upgrade (before connection is established).
+                # 401/403 = server rejects auth for this specific session → dead session.
+                # We bail after MAX_HANDSHAKE_AUTH_FAILS consecutive fails (margin for
+                # token refresh edge cases). 5xx = real server issue, stays transient.
+                status = getattr(e.response, "status_code", None)
+                if status in (401, 403):
+                    handshake_auth_fails += 1
+                    if handshake_auth_fails >= MAX_HANDSHAKE_AUTH_FAILS:
+                        log.warning(
+                            f"[{self.short_id}] Dead session — HTTP {status} at handshake "
+                            f"x{handshake_auth_fails}. Bailing."
+                        )
+                        log_to_file(
+                            f"RC BAIL {self.project}: dead session (HTTP {status} at handshake)"
+                        )
+                        # Add to denylist so scan loop doesn't re-discover and retry.
+                        _DEAD_SESSIONS.add(self.session_id)
+                        break
+                    log.warning(
+                        f"[{self.short_id}] HTTP {status} at handshake "
+                        f"{handshake_auth_fails}/{MAX_HANDSHAKE_AUTH_FAILS}"
+                    )
+                else:
+                    # 5xx or unexpected status — treat as transient network issue
+                    transient_drops += 1
+                    log.warning(
+                        f"[{self.short_id}] Handshake HTTP {status}, transient #{transient_drops}"
+                    )
 
             except Exception as e:
                 transient_drops += 1
@@ -1072,6 +1115,10 @@ async def run(args):
         for sess in sessions:
             sid = sess.get("sessionId", "")
             if not sid or sid in active_monitors:
+                continue
+            if sid in _DEAD_SESSIONS:
+                # Previously bailed as dead session (HTTP 401 at handshake).
+                # Skip silently — restart the conductor to retry.
                 continue
 
             name = session_friendly_name(sess)
