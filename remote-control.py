@@ -703,9 +703,17 @@ def discover_rc_sessions_api(access_token: str, org_uuid: str) -> list[dict]:
 
 def discover_all_rc_sessions(access_token: str, org_uuid: str) -> list[dict]:
     """
-    Merge local bridge-pointer discovery with API discovery.
-    Prefer API data (has connection status), enrich with local data (has project name).
-    Only return sessions that are connected or recently active.
+    Discover RC sessions. The Anthropic API is authoritative: it only lists
+    sessions that are actually running in `--rc` mode and eligible for
+    WebSocket subscription. Local bridge-pointer.json files are used ONLY
+    to enrich API results with friendly project names and cwd info.
+
+    Previously this function also added "local-only" sessions (bridge-pointer
+    present but not in API) as a fallback. That was a bug: it picked up
+    regular REPL sessions (including the conductor's own parent Claude Code
+    session) and tried to WebSocket-subscribe to them. The server would
+    accept the upgrade but close with 1006 after ~5s because no RC protocol
+    exists for non-RC sessions, producing an endless reconnect loop.
     """
     local = {s["sessionId"]: s for s in discover_rc_sessions_local()}
     api = {s["sessionId"]: s for s in discover_rc_sessions_api(access_token, org_uuid)}
@@ -713,7 +721,7 @@ def discover_all_rc_sessions(access_token: str, org_uuid: str) -> list[dict]:
     merged = {}
     for sid, data in api.items():
         entry = data.copy()
-        # Enrich with local project name if available
+        # Enrich with local project name and cwd if available
         if sid in local:
             local_data = local[sid]
             if local_data.get("project") and local_data["project"] != "unknown":
@@ -721,16 +729,10 @@ def discover_all_rc_sessions(access_token: str, org_uuid: str) -> list[dict]:
             entry["projectDir"] = local_data.get("projectDir", "")
         merged[sid] = entry
 
-    # Add local-only sessions (bridge-pointer exists but not in API — might be stale)
-    for sid, data in local.items():
-        if sid not in merged:
-            data["connectionStatus"] = "unknown"
-            merged[sid] = data
-
-    # Filter: only connected or unknown (stale pointers might still be active)
+    # Filter: only connected or empty-status (newly created, not yet in steady state)
     active = [
         s for s in merged.values()
-        if s.get("connectionStatus") in ("connected", "unknown", "")
+        if s.get("connectionStatus") in ("connected", "")
     ]
 
     return active

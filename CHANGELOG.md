@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Self-monitoring loop on non-RC sessions.** `discover_all_rc_sessions()`
+  previously included sessions found only in local `bridge-pointer.json`
+  files (without API confirmation) and tried to WebSocket-subscribe to
+  them. The conductor's own parent Claude Code REPL session has a
+  bridge-pointer file but is NOT an RC session, so the server accepted
+  the upgrade and then closed with code 1006 after ~5s because no RC
+  protocol exists — producing an endless reconnect loop (~7-8s period).
+  The API is now authoritative for session discovery; local
+  bridge-pointer files are used only to enrich API results with friendly
+  project names and cwd info.
+
+### Added
+- Unit tests T8-T11 covering `discover_all_rc_sessions()`: API-only
+  inclusion, local-only exclusion (the regression case), API+local
+  enrichment, and disconnected-status filtering.
+
 ## [0.2.0] - 2026-04-10
 
 ### Added

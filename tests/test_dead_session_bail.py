@@ -298,3 +298,142 @@ def test_T6_scan_loop_contains_dead_sessions_skip():
     assert "sid in _DEAD_SESSIONS" in source, (
         "Scan loop must have the 'if sid in _DEAD_SESSIONS' check"
     )
+
+
+# ---------------------------------------------------------------------------
+# T8-T11: discover_all_rc_sessions — API is authoritative, local is enrichment
+#
+# Regression tests for the self-monitoring loop bug where
+# discover_all_rc_sessions picked up non-RC sessions from local
+# bridge-pointer.json files and tried to subscribe to them, causing
+# endless 1006 reconnect cycles against the conductor's own parent
+# Claude Code REPL session.
+# ---------------------------------------------------------------------------
+
+def test_T8_discover_api_only_session_is_included():
+    """T8: A session in the API (and not in local) should be included."""
+    with patch.object(
+        remote_control,
+        "discover_rc_sessions_api",
+        return_value=[
+            {
+                "sessionId": "session_api_only_001",
+                "cseId": "cse_api_only_001",
+                "connectionStatus": "connected",
+                "project": "api-project",
+                "createdAt": "2026-04-10T00:00:00Z",
+                "source": "api",
+            }
+        ],
+    ):
+        with patch.object(remote_control, "discover_rc_sessions_local", return_value=[]):
+            result = remote_control.discover_all_rc_sessions("tok", "org")
+
+    assert len(result) == 1
+    assert result[0]["sessionId"] == "session_api_only_001"
+
+
+def test_T9_discover_local_only_session_is_EXCLUDED():
+    """
+    T9 (the core regression test): A session present ONLY in local
+    bridge-pointer.json but NOT in the API must be EXCLUDED. This was
+    the bug that caused the 1006 self-monitoring loop on the conductor's
+    own parent Claude Code session.
+    """
+    with patch.object(remote_control, "discover_rc_sessions_api", return_value=[]):
+        with patch.object(
+            remote_control,
+            "discover_rc_sessions_local",
+            return_value=[
+                {
+                    "sessionId": "session_local_only_repl_666",
+                    "environmentId": "env_fake",
+                    "project": "Claude",
+                    "projectDir": "/fake/path/Claude",
+                    "source": "bridge-pointer",
+                }
+            ],
+        ):
+            result = remote_control.discover_all_rc_sessions("tok", "org")
+
+    assert result == [], (
+        "Local-only sessions (bridge-pointer without API entry) must be "
+        "EXCLUDED. If included, the conductor will try to subscribe to "
+        "non-RC sessions and hit the 1006 reconnect loop."
+    )
+
+
+def test_T10_discover_api_session_is_enriched_with_local_project_name():
+    """
+    T10: When a session is in both API and local, the local project name
+    should enrich the API entry. This preserves the valuable part of
+    local discovery (human-readable project names) without reintroducing
+    the self-monitoring bug.
+    """
+    sid = "session_both_001"
+    with patch.object(
+        remote_control,
+        "discover_rc_sessions_api",
+        return_value=[
+            {
+                "sessionId": sid,
+                "cseId": "cse_both_001",
+                "connectionStatus": "connected",
+                "project": "unknown",  # API title is generic
+                "createdAt": "2026-04-10T00:00:00Z",
+                "source": "api",
+            }
+        ],
+    ):
+        with patch.object(
+            remote_control,
+            "discover_rc_sessions_local",
+            return_value=[
+                {
+                    "sessionId": sid,
+                    "environmentId": "env_123",
+                    "project": "rentcompare",  # nice local project name
+                    "projectDir": "/fake/projects/rentcompare",
+                    "source": "bridge-pointer",
+                }
+            ],
+        ):
+            result = remote_control.discover_all_rc_sessions("tok", "org")
+
+    assert len(result) == 1
+    assert result[0]["project"] == "rentcompare", (
+        "Local project name should enrich the API entry"
+    )
+    assert result[0]["projectDir"] == "/fake/projects/rentcompare"
+    assert result[0]["connectionStatus"] == "connected"
+
+
+def test_T11_discover_disconnected_api_session_is_filtered_out():
+    """
+    T11: Sessions with connectionStatus='disconnected' must be filtered
+    out — they're stale in the API but not subscribable. Only 'connected'
+    or empty status should pass through.
+    """
+    with patch.object(
+        remote_control,
+        "discover_rc_sessions_api",
+        return_value=[
+            {
+                "sessionId": "session_active_001",
+                "cseId": "cse_active_001",
+                "connectionStatus": "connected",
+                "project": "active-project",
+            },
+            {
+                "sessionId": "session_stale_002",
+                "cseId": "cse_stale_002",
+                "connectionStatus": "disconnected",
+                "project": "stale-project",
+            },
+        ],
+    ):
+        with patch.object(remote_control, "discover_rc_sessions_local", return_value=[]):
+            result = remote_control.discover_all_rc_sessions("tok", "org")
+
+    assert len(result) == 1
+    assert result[0]["sessionId"] == "session_active_001"
