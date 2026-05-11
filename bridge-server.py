@@ -310,10 +310,117 @@ def is_pid_alive(pid):
 
 
 def _iter_session_files():
-    """Iterate all session JSON files across Windows and WSL."""
+    """Iterate all session JSON files across Windows and WSL.
+
+    NOTE (2026-05-11): Recent Claude Code versions stopped writing session
+    metadata JSON files to ~/.claude/sessions/. This function still works for
+    legacy installs but will yield nothing on current CC. New code paths use
+    _iter_session_metadata() which discovers sessions from the JSONL
+    transcripts in ~/.claude/projects/.
+    """
     for sdir in ALL_SESSION_DIRS:
         if sdir.exists():
             yield from sdir.glob("*.json")
+
+
+# Mtime-based liveness threshold for the new JSONL-based discovery.
+# We can't reliably get PID from JSONL alone, so a session is "alive" if
+# its transcript was modified recently.
+ALIVE_THRESHOLD_SECONDS = 600  # 10 minutes
+
+
+def _decode_project_dir_name(name):
+    """Best-effort cwd recovery from encoded project dir name.
+
+    Claude Code encodes the cwd into a dir name like:
+      C:\\Users\\Asus G14\\projects\\trading -> C--Users-Asus-G14-projects-trading
+
+    Encoding is lossy (spaces and path separators both become '-'), so this
+    is best-effort. Returns the decoded path as a string, falling back to
+    the encoded name if decoding fails.
+    """
+    if not name:
+        return ""
+    # Common pattern: starts with single letter + '--' (drive letter on Windows)
+    if len(name) >= 3 and name[1:3] == "--":
+        return name[0] + ":\\" + name[3:].replace("-", "\\")
+    # Otherwise just hand back what we have
+    return name
+
+
+def _extract_jsonl_metadata(jsonl_path, max_scan=15):
+    """Read first N lines of a JSONL transcript to extract sessionId and cwd.
+
+    The first line is typically a permission-mode stub; cwd usually appears
+    in the first user/system entry (around line 2-3). We scan up to max_scan
+    lines to be safe.
+    """
+    session_id = ""
+    cwd = ""
+    try:
+        with open(jsonl_path, encoding="utf-8") as f:
+            for i, line in enumerate(f):
+                if i >= max_scan:
+                    break
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                if not session_id:
+                    session_id = d.get("sessionId", "") or session_id
+                if not cwd:
+                    cwd = d.get("cwd", "") or cwd
+                if session_id and cwd:
+                    break
+    except Exception:
+        pass
+
+    # Fallbacks: sessionId from filename, cwd from parent dir name
+    if not session_id:
+        session_id = jsonl_path.stem
+    if not cwd:
+        cwd = _decode_project_dir_name(jsonl_path.parent.name)
+    return session_id, cwd
+
+
+def _iter_session_metadata():
+    """Yield dicts shaped like the old session JSON files.
+
+    Replacement for `_iter_session_files()` that works with current Claude
+    Code (post-~v2.x), which no longer writes JSON metadata to
+    ~/.claude/sessions/. Sources truth from JSONL transcripts in
+    ~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl.
+
+    Each yielded dict has the keys the bridge tools expect:
+      sessionId, cwd, startedAt (epoch ms), pid (None — not recoverable),
+      alive (bool, mtime-based heuristic), jsonl (Path).
+    """
+    import time
+
+    now = time.time()
+    seen_session_ids = set()
+
+    for project_dir in _iter_project_dirs():
+        for jsonl_path in project_dir.glob("*.jsonl"):
+            try:
+                mtime = jsonl_path.stat().st_mtime
+            except Exception:
+                continue
+
+            session_id, cwd = _extract_jsonl_metadata(jsonl_path)
+            if not session_id or session_id in seen_session_ids:
+                continue
+            seen_session_ids.add(session_id)
+
+            yield {
+                "sessionId": session_id,
+                "cwd": cwd,
+                "startedAt": int(mtime * 1000),  # legacy callers expect epoch ms
+                "pid": None,  # no longer recoverable from local files
+                "alive": (now - mtime) < ALIVE_THRESHOLD_SECONDS,
+                "jsonl": jsonl_path,
+                "mtime": mtime,
+            }
 
 
 def _iter_project_dirs():
@@ -433,46 +540,40 @@ def tool_list_sessions(args):
     alive_only = args.get("alive_only", True)
     sessions = []
 
-    for sf in sorted(
-        _iter_session_files(), key=lambda f: f.stat().st_mtime, reverse=True
-    ):
-        try:
-            with open(sf) as f:
-                data = json.load(f)
-        except Exception:
+    # Sort by mtime desc — most recently active first
+    entries = sorted(
+        _iter_session_metadata(), key=lambda e: e["mtime"], reverse=True
+    )
+
+    for meta in entries:
+        if alive_only and not meta["alive"]:
             continue
 
-        pid = data.get("pid")
-        session_id = data.get("sessionId", "")
-        cwd = data.get("cwd", "")
-        started_at = data.get("startedAt", 0)
-
-        alive = is_pid_alive(pid)
-        if alive_only and not alive:
-            continue
+        session_id = meta["sessionId"]
+        cwd = meta["cwd"]
 
         # Last user message
         last_msg = ""
-        jsonl = find_jsonl(session_id)
+        jsonl = meta.get("jsonl") or find_jsonl(session_id)
         if jsonl:
             lines = read_last_n_lines(jsonl, 15)
-            entries = parse_jsonl_entries(lines)
-            for e in reversed(entries):
+            jsonl_entries = parse_jsonl_entries(lines)
+            for e in reversed(jsonl_entries):
                 if e["type"] == "user":
                     last_msg = e["text"][:200]
                     break
 
-        started = datetime.fromtimestamp(started_at / 1000)
+        started = datetime.fromtimestamp(meta["startedAt"] / 1000)
         duration_min = int((datetime.now() - started).total_seconds() / 60)
         project_name = Path(cwd).name if cwd else "unknown"
 
         sessions.append(
             {
-                "pid": pid,
+                "pid": meta["pid"],
                 "sessionId": session_id,
                 "project": project_name,
                 "cwd": cwd,
-                "alive": alive,
+                "alive": meta["alive"],
                 "startedAt": started.isoformat(),
                 "durationMinutes": duration_min,
                 "lastUserMessage": last_msg,
@@ -501,22 +602,17 @@ def tool_get_status(args):
 
     # Find session metadata
     session_data = None
-    for sf in _iter_session_files():
-        try:
-            with open(sf) as f:
-                d = json.load(f)
-            if d.get("sessionId") == session_id:
-                session_data = d
-                break
-        except Exception:
-            continue
+    for meta in _iter_session_metadata():
+        if meta["sessionId"] == session_id:
+            session_data = meta
+            break
 
     if not session_data:
         return {"error": f"Session {session_id} not found"}
 
-    pid = session_data.get("pid")
-    cwd = session_data.get("cwd", "")
-    alive = is_pid_alive(pid)
+    pid = session_data["pid"]
+    cwd = session_data["cwd"]
+    alive = session_data["alive"]
 
     if not alive:
         return {
@@ -593,21 +689,15 @@ def tool_get_status(args):
 def tool_get_all_waiting(args):
     waiting = []
 
-    for sf in _iter_session_files():
-        try:
-            with open(sf) as f:
-                data = json.load(f)
-        except Exception:
+    for meta in _iter_session_metadata():
+        if not meta["alive"]:
             continue
 
-        pid = data.get("pid")
-        session_id = data.get("sessionId", "")
-        cwd = data.get("cwd", "")
+        pid = meta["pid"]
+        session_id = meta["sessionId"]
+        cwd = meta["cwd"]
 
-        if not is_pid_alive(pid):
-            continue
-
-        jsonl = find_jsonl(session_id)
+        jsonl = meta.get("jsonl") or find_jsonl(session_id)
         if not jsonl:
             continue
 
@@ -1003,15 +1093,9 @@ def tool_cleanup(args):
     goals = _read_json(GOALS_FILE)
     if goals:
         alive_sessions = set()
-        for sf in _iter_session_files():
-            try:
-                with open(sf) as f:
-                    data = json.load(f)
-                pid = data.get("pid")
-                if pid and is_pid_alive(pid):
-                    alive_sessions.add(data.get("sessionId", ""))
-            except Exception:
-                continue
+        for meta in _iter_session_metadata():
+            if meta["alive"]:
+                alive_sessions.add(meta["sessionId"])
 
         new_goals = {}
         for sid, goal in goals.items():
@@ -1032,15 +1116,9 @@ def tool_cleanup(args):
     flags_dir = CONDUCTOR_DIR / "flags"
     if flags_dir.exists():
         alive_sessions = set()
-        for sf in _iter_session_files():
-            try:
-                with open(sf) as f:
-                    data = json.load(f)
-                pid = data.get("pid")
-                if pid and is_pid_alive(pid):
-                    alive_sessions.add(data.get("sessionId", ""))
-            except Exception:
-                continue
+        for meta in _iter_session_metadata():
+            if meta["alive"]:
+                alive_sessions.add(meta["sessionId"])
 
         for flag_file in flags_dir.glob("*.json"):
             sid = flag_file.stem
