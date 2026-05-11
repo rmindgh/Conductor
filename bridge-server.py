@@ -26,6 +26,20 @@ CLAUDE_HOME = Path.home() / ".claude"
 SESSIONS_DIR = CLAUDE_HOME / "sessions"
 PROJECTS_DIR = CLAUDE_HOME / "projects"
 CONDUCTOR_DIR = CLAUDE_HOME / "conductor"
+
+# WSL paths for cross-OS session monitoring
+WSL_CLAUDE_HOMES = []
+_wsl_base = Path("//wsl.localhost")
+if _wsl_base.exists():
+    for distro in _wsl_base.iterdir():
+        if distro.is_dir():
+            for home_dir in (distro / "home").iterdir() if (distro / "home").exists() else []:
+                wsl_claude = home_dir / ".claude"
+                if wsl_claude.exists():
+                    WSL_CLAUDE_HOMES.append(wsl_claude)
+
+ALL_SESSION_DIRS = [SESSIONS_DIR] + [h / "sessions" for h in WSL_CLAUDE_HOMES]
+ALL_PROJECT_DIRS = [PROJECTS_DIR] + [h / "projects" for h in WSL_CLAUDE_HOMES]
 GOALS_FILE = CONDUCTOR_DIR / "goals.json"
 DECISIONS_FILE = CONDUCTOR_DIR / "decisions.json"
 LOG_FILE = CONDUCTOR_DIR / "log.md"
@@ -226,7 +240,23 @@ TOOLS = [
         "description": (
             "Find all Remote Control sessions by reading bridge-pointer.json files "
             "and querying the Anthropic API. Returns server-side session IDs with "
-            "friendly project names and connection status."
+            "friendly project names and connection status. Filters to connected-only by default."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "connected_only": {
+                    "type": "boolean",
+                    "description": "Only show connected sessions (default true). Set false to see all including disconnected.",
+                },
+            },
+        },
+    },
+    {
+        "name": "cleanup",
+        "description": (
+            "Purge stale data: orphaned goals (session no longer alive), old decisions, "
+            "and disconnected RC sessions from the discovery cache. Run after restarting terminals."
         ),
         "inputSchema": {"type": "object", "properties": {}},
     },
@@ -279,11 +309,25 @@ def is_pid_alive(pid):
         return False
 
 
+def _iter_session_files():
+    """Iterate all session JSON files across Windows and WSL."""
+    for sdir in ALL_SESSION_DIRS:
+        if sdir.exists():
+            yield from sdir.glob("*.json")
+
+
+def _iter_project_dirs():
+    """Iterate all project directories across Windows and WSL."""
+    for pdir in ALL_PROJECT_DIRS:
+        if pdir.exists():
+            for d in pdir.iterdir():
+                if d.is_dir():
+                    yield d
+
+
 def find_jsonl(session_id):
     """Find the JSONL conversation log for a session across all project dirs."""
-    for project_dir in PROJECTS_DIR.iterdir():
-        if not project_dir.is_dir():
-            continue
+    for project_dir in _iter_project_dirs():
         jsonl = project_dir / f"{session_id}.jsonl"
         if jsonl.exists():
             return jsonl
@@ -390,7 +434,7 @@ def tool_list_sessions(args):
     sessions = []
 
     for sf in sorted(
-        SESSIONS_DIR.glob("*.json"), key=lambda f: f.stat().st_mtime, reverse=True
+        _iter_session_files(), key=lambda f: f.stat().st_mtime, reverse=True
     ):
         try:
             with open(sf) as f:
@@ -457,7 +501,7 @@ def tool_get_status(args):
 
     # Find session metadata
     session_data = None
-    for sf in SESSIONS_DIR.glob("*.json"):
+    for sf in _iter_session_files():
         try:
             with open(sf) as f:
                 d = json.load(f)
@@ -549,7 +593,7 @@ def tool_get_status(args):
 def tool_get_all_waiting(args):
     waiting = []
 
-    for sf in SESSIONS_DIR.glob("*.json"):
+    for sf in _iter_session_files():
         try:
             with open(sf) as f:
                 data = json.load(f)
@@ -862,10 +906,8 @@ def tool_discover_rc_sessions(args):
     """Find all Remote Control sessions from bridge-pointer.json files and API."""
     sessions = []
 
-    # Local discovery via bridge-pointer.json
-    for project_dir in PROJECTS_DIR.iterdir():
-        if not project_dir.is_dir():
-            continue
+    # Local discovery via bridge-pointer.json (Windows + WSL)
+    for project_dir in _iter_project_dirs():
         pointer = project_dir / "bridge-pointer.json"
         if not pointer.exists():
             continue
@@ -876,7 +918,7 @@ def tool_discover_rc_sessions(args):
             if not session_id:
                 continue
 
-            # Friendly name from dir: e.g. C--Users-Jane-Desktop-myproject → myproject
+            # Friendly name from dir: C--Users-Asus-G14-Desktop-rentcompare → rentcompare
             parts = project_dir.name.split("-")
             project_name = parts[-1] if parts else project_dir.name
 
@@ -941,7 +983,72 @@ def tool_discover_rc_sessions(args):
     except Exception:
         pass
 
+    # Filter by connection status
+    connected_only = args.get("connected_only", True)
+    if connected_only:
+        sessions = [
+            s for s in sessions
+            if s.get("connectionStatus", "") in ("connected", "")
+            or s.get("source") == "bridge-pointer" and "connectionStatus" not in s
+        ]
+
     return {"sessions": sessions, "count": len(sessions)}
+
+
+def tool_cleanup(args):
+    """Purge orphaned goals, old decisions, and stale flag files."""
+    cleaned = {"goals_removed": 0, "decisions_trimmed": 0, "flags_removed": 0}
+
+    # 1. Clean orphaned goals — remove goals for sessions that are no longer alive
+    goals = _read_json(GOALS_FILE)
+    if goals:
+        alive_sessions = set()
+        for sf in _iter_session_files():
+            try:
+                with open(sf) as f:
+                    data = json.load(f)
+                pid = data.get("pid")
+                if pid and is_pid_alive(pid):
+                    alive_sessions.add(data.get("sessionId", ""))
+            except Exception:
+                continue
+
+        new_goals = {}
+        for sid, goal in goals.items():
+            if sid in alive_sessions:
+                new_goals[sid] = goal
+            else:
+                cleaned["goals_removed"] += 1
+        _write_json(GOALS_FILE, new_goals)
+
+    # 2. Trim decisions to last 50
+    decisions = _read_json(DECISIONS_FILE, default=[])
+    if isinstance(decisions, list) and len(decisions) > 50:
+        trimmed = len(decisions) - 50
+        _write_json(DECISIONS_FILE, decisions[-50:])
+        cleaned["decisions_trimmed"] = trimmed
+
+    # 3. Clean stale flag files
+    flags_dir = CONDUCTOR_DIR / "flags"
+    if flags_dir.exists():
+        alive_sessions = set()
+        for sf in _iter_session_files():
+            try:
+                with open(sf) as f:
+                    data = json.load(f)
+                pid = data.get("pid")
+                if pid and is_pid_alive(pid):
+                    alive_sessions.add(data.get("sessionId", ""))
+            except Exception:
+                continue
+
+        for flag_file in flags_dir.glob("*.json"):
+            sid = flag_file.stem
+            if sid not in alive_sessions:
+                flag_file.unlink()
+                cleaned["flags_removed"] += 1
+
+    return {"status": "ok", "cleaned": cleaned}
 
 
 def tool_send_task(args):
@@ -1018,6 +1125,7 @@ TOOL_HANDLERS = {
     "get_flags": tool_get_flags,
     "discover_rc_sessions": tool_discover_rc_sessions,
     "send_task": tool_send_task,
+    "cleanup": tool_cleanup,
 }
 
 
